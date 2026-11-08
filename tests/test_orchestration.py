@@ -2,6 +2,7 @@ import csv
 import argparse
 import sys
 import subprocess
+import json
 from types import SimpleNamespace
 
 import pandas as pd
@@ -98,3 +99,58 @@ def test_timeout_terminates_observed_children_and_reaps_parent(monkeypatch):
     monkeypatch.setattr(orchestrate.psutil, "Process", lambda pid: parent)
     assert orchestrate.measure("spark", "1m", "q1_groupby", "synthetic.parquet", 1) == {"status": "timeout"}
     assert killed == ["child", "parent"] and process.calls == 2
+
+
+@pytest.mark.parametrize('output', ['', '{}', '[]', '{broken',
+                                    json.dumps({'engine': 'duckdb', 'tier': '1m', 'query': 'q1_groupby', 'seconds': float('nan')}),
+                                    json.dumps({'engine': 'spark', 'tier': '1m', 'query': 'q1_groupby', 'seconds': 1})])
+def test_malformed_worker_measurement_is_a_recorded_failure(monkeypatch, output):
+    process = SimpleNamespace(pid=123, returncode=0, communicate=lambda timeout: (output, ''))
+    parent = SimpleNamespace(children=lambda recursive: [], is_running=lambda: True,
+                             memory_info=lambda: SimpleNamespace(rss=1024))
+    monkeypatch.setattr(orchestrate.subprocess, 'Popen', lambda *args, **kwargs: process)
+    monkeypatch.setattr(orchestrate.psutil, 'Process', lambda pid: parent)
+    assert orchestrate.measure('duckdb', '1m', 'q1_groupby', 'synthetic.parquet', 1)['status'] == 'error'
+
+
+def test_atomic_csv_checkpoint_preserves_previous_bytes_on_serialization_failure(tmp_path, monkeypatch):
+    path = tmp_path / 'results.csv'
+    old = b'tier,status\n1m,ok\n'
+    path.write_bytes(old)
+    real_writer = orchestrate.csv.DictWriter
+
+    def broken_writer(stream, fieldnames):
+        writer = real_writer(stream, fieldnames=fieldnames)
+
+        def fail(rows):
+            stream.write('partial broken row')
+            raise OSError('disk failure')
+
+        writer.writerows = fail
+        return writer
+
+    monkeypatch.setattr(orchestrate.csv, 'DictWriter', broken_writer)
+    with pytest.raises(OSError, match='disk failure'):
+        orchestrate.write_results(str(path), [{'tier': '6m', 'status': 'ok'}])
+    assert path.read_bytes() == old
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.parametrize('selection,value', [('tiers', '1m'), ('engines', 'duckdb'), ('queries', 'q1_groupby')])
+def test_duplicate_matrix_selections_are_refused(selection, value, monkeypatch):
+    monkeypatch.setattr(sys, 'argv', ['bench', f'--{selection}', value, value])
+    with pytest.raises(SystemExit) as error:
+        orchestrate.main()
+    assert error.value.code == 2
+
+
+def test_duplicate_or_nonfinite_cases_cannot_inflate_report_totals():
+    from tbench.report import totals
+    frame = pd.DataFrame([{'engine': 'duckdb', 'tier': '1m', 'query': f'q{i}',
+                           'status': 'ok', 'median_s': 1.0, 'peak_gb': 1.0} for i in range(4)])
+    assert totals(frame).total_s.iloc[0] == 4
+    with pytest.raises(ValueError, match='Duplicate'):
+        totals(pd.concat([frame, frame.iloc[[0]]]))
+    frame.loc[0, 'median_s'] = float('nan')
+    with pytest.raises(ValueError, match='finite'):
+        totals(frame)
