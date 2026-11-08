@@ -44,8 +44,20 @@ def measure(engine: str, tier: str, query: str, out: str, timeout: int) -> dict:
     try:
         so, se = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        # Killing only Python leaves Spark's JVM running and contaminates later measurements.
+        try:
+            children = psutil.Process(p.pid).children(recursive=True)
+        except psutil.Error:
+            children = []
+        for child in reversed(children):
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                pass
         p.kill()
+        p.communicate()
         stop.set()
+        th.join(1)
         return {"status": "timeout"}
     stop.set()
     th.join(1)
@@ -61,24 +73,31 @@ def same(a: pd.DataFrame, b: pd.DataFrame) -> bool:
     if list(a.columns) != list(b.columns) or len(a) != len(b):
         return False
     for c in a.columns:
-        if a[c].dtype.kind in "fc":
-            if not ((a[c] - b[c]).abs() <= 1e-6 * (b[c].abs() + 1)).all():
-                return False
-        elif not (a[c].values == b[c].values).all():
+        try:
+            pd.testing.assert_series_equal(a[c], b[c], check_dtype=False, check_names=False,
+                                           check_exact=a[c].dtype.kind not in "fc", rtol=1e-6, atol=1e-6)
+        except AssertionError:
             return False
     return True
 
 
-def main() -> None:
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tiers", nargs="*", default=TIERS)
-    ap.add_argument("--engines", nargs="*", default=list(ENGINES))
-    ap.add_argument("--queries", nargs="*", default=QUERIES)
-    ap.add_argument("--reps", type=int, default=3)
-    ap.add_argument("--timeout", type=int, default=1200)
+    ap.add_argument("--tiers", nargs="+", choices=TIERS, default=TIERS)
+    ap.add_argument("--engines", nargs="+", choices=list(ENGINES), default=list(ENGINES))
+    ap.add_argument("--queries", nargs="+", choices=QUERIES, default=QUERIES)
+    ap.add_argument("--reps", type=positive_int, default=3)
+    ap.add_argument("--timeout", type=positive_int, default=1200)
     ap.add_argument("--out", default=RESULTS)
     a = ap.parse_args()
-    os.makedirs(os.path.dirname(a.out), exist_ok=True)
+    os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     rows = []
     tmp = tempfile.mkdtemp()
     for tier in a.tiers:
@@ -89,16 +108,24 @@ def main() -> None:
                 if eng not in a.engines and eng != "duckdb":
                     continue
                 times, peaks, agree, last = [], [], None, None
+                reference = None
                 for r in range(a.reps):
                     out = ref_path if eng == "duckdb" else f"{tmp}/{eng}_{tier}_{q}.parquet"
                     m = measure(eng, tier, q, out, a.timeout)
                     last = m
                     if m["status"] != "ok":
                         break
+                    result = pd.read_parquet(out)
+                    if eng == "duckdb" and r == 0:
+                        reference = result
+                    expected = reference if eng == "duckdb" else pd.read_parquet(ref_path)
+                    if not same(result, expected):
+                        agree = False
+                        last = {"status": "mismatch", "detail": f"result mismatch on repetition {r + 1}"}
+                        break
+                    agree = True
                     times.append(m["seconds"])
                     peaks.append(m["peak_gb"])
-                    if r == 0 and eng != "duckdb":
-                        agree = same(pd.read_parquet(out), pd.read_parquet(ref_path))
                 row = {"tier": tier, "files": n_files, "query": q, "engine": eng, "status": last["status"],
                        "median_s": round(statistics.median(times), 2) if times else "",
                        "min_s": min(times) if times else "", "runs": len(times),
@@ -110,7 +137,10 @@ def main() -> None:
                     w = csv.DictWriter(fh, fieldnames=list(row))
                     w.writeheader()
                     w.writerows(rows)
+                if eng == "duckdb" and row["status"] != "ok":
+                    break  # no validated reference exists for the remaining engines
+    return 0 if rows and all(row["status"] == "ok" for row in rows) else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

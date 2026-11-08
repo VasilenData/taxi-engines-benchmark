@@ -27,6 +27,20 @@ def totals(df: pd.DataFrame) -> pd.DataFrame:
     return g[g["n"] == 4]
 
 
+def comparison_summary(df: pd.DataFrame) -> str:
+    failures = df[(df.status != "ok") | ((df.engine != "duckdb") & (df.agrees_with_duckdb.astype(str) != "True"))]
+    compared = df[(df.engine != "duckdb") & (df.status == "ok") & (df.agrees_with_duckdb.astype(str) == "True")]
+    text = f"{len(compared)} recorded cross-engine case(s) agreed with DuckDB. "
+    if not failures.empty:
+        text += f"{len(failures)} case(s) failed or lacked a valid comparison: " + ", ".join(
+            f"{row.engine}/{row.tier}/{row['query']} ({row.status})" for _, row in failures.iterrows()) + "."
+    elif compared.empty:
+        text += "No cross-engine comparisons were recorded."
+    else:
+        text += "All recorded cases passed; this statement covers only the selected engines, queries and sizes."
+    return text
+
+
 def markdown(df: pd.DataFrame, rows_by_tier: dict[str, int]) -> str:
     out = ["# Results", ""]
     t = totals(df)
@@ -54,10 +68,8 @@ def markdown(df: pd.DataFrame, rows_by_tier: dict[str, int]) -> str:
             r = big[(big["query"] == q) & (big.engine == e)]
             cells.append(f"{r.median_s.iloc[0]:.2f}" if len(r) and r.status.iloc[0] == "ok" else "failed")
         out.append(f"| {q} | " + " | ".join(cells) + " |")
-    bad = df[(df.engine != "duckdb") & (df.status == "ok") & (df.agrees_with_duckdb.astype(str) != "True")]
     out += ["", "## Correctness", "",
-            "Every engine's answer was compared with DuckDB's for every query and size (numbers within 1e-6 relative). "
-            + ("All answers agreed." if bad.empty else f"{len(bad)} result(s) did NOT agree: " + ", ".join(f"{r.engine}/{r.tier}/{r['query']}" for _, r in bad.iterrows()))]
+            comparison_summary(df)]
     return "\n".join(out) + "\n"
 
 

@@ -38,12 +38,14 @@ Total seconds for all four queries. Peak memory at 24 months: DuckDB 0.7 GB, Pol
 
 ## How it is measured, and the limits
 
-* Every (engine, size, query) runs in a **fresh process**; the table shows the median of repeated runs. Peak memory is sampled across the whole process tree so Spark's JVM is counted.
+* Every (engine, size, query) runs in a **fresh process**; the table shows the median of repeated runs. Each repetition is compared with the reference before its timing is accepted, and a mismatch fails the command. Peak memory is sampled across the whole process tree so Spark's JVM is counted. A timeout terminates the benchmark process and its observed children.
 * Timing includes reading the files and ends when the result is a pandas DataFrame. Spark's start-up is included.
 * **Warm cache:** the files were already in the operating system cache, so cold reads from a slow disk would narrow the gaps.
 * Only 6 of 19 columns are read. pandas could be made faster with tuning or chunking; I measured the straightforward version most people would write.
 * One machine: a 17-core cloud VM. pandas is single-threaded by design. Absolute numbers will differ on your hardware; the ratios and the correctness checks are the point.
 * Not tested: data larger than memory, multi-node Spark, cold caches, concurrent users.
+
+Dataset tiers require their exact published months. A missing file fails before measurement instead of silently benchmarking a smaller dataset under the requested tier's name; unrelated monthly files are excluded. Reports identify failed/mismatched cases explicitly and describe agreement only for the recorded cases. The historical results above have not been rerun as part of these runner safeguards.
 
 ## Run it
 
