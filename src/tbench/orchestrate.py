@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
+from pathlib import Path
 import statistics
 import subprocess
 import sys
@@ -64,9 +66,37 @@ def measure(engine: str, tier: str, query: str, out: str, timeout: int) -> dict:
     if p.returncode != 0:
         tail = "MemoryError" if "MemoryError" in se else se.strip().splitlines()[-1][:120] if se.strip() else "failed"
         return {"status": "error", "detail": tail}
-    d = json.loads(so.strip().splitlines()[-1])
+    try:
+        d = json.loads(so.strip().splitlines()[-1])
+        seconds = d['seconds']
+        if (not isinstance(seconds, (int, float)) or isinstance(seconds, bool)
+                or not math.isfinite(seconds) or seconds < 0):
+            raise ValueError('invalid seconds')
+        if (d.get('engine'), d.get('tier'), d.get('query')) != (engine, tier, query):
+            raise ValueError('worker identity does not match requested case')
+    except (ValueError, TypeError, KeyError, IndexError):
+        return {'status': 'error', 'detail': 'invalid worker measurement output'}
     d.update(status="ok", peak_gb=round(peak / 1e9, 2))
     return d
+
+
+def write_results(path: str, rows: list[dict]) -> None:
+    """Replace a complete CSV checkpoint; serialization failure preserves the old one."""
+    destination = Path(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', newline='', encoding='utf-8',
+                                         dir=destination.parent, prefix='.benchmark-', delete=False) as stream:
+            temporary = Path(stream.name)
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def same(a: pd.DataFrame, b: pd.DataFrame) -> bool:
@@ -97,6 +127,10 @@ def main() -> int:
     ap.add_argument("--timeout", type=positive_int, default=1200)
     ap.add_argument("--out", default=RESULTS)
     a = ap.parse_args()
+    for name in ('tiers', 'engines', 'queries'):
+        values = getattr(a, name)
+        if len(values) != len(set(values)):
+            ap.error(f'--{name} must not contain duplicates')
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     rows = []
     tmp = tempfile.mkdtemp()
@@ -133,10 +167,7 @@ def main() -> int:
                        "detail": last.get("detail", "")}
                 rows.append(row)
                 print(row, flush=True)
-                with open(a.out, "w", newline="") as fh:
-                    w = csv.DictWriter(fh, fieldnames=list(row))
-                    w.writeheader()
-                    w.writerows(rows)
+                write_results(a.out, rows)
                 if eng == "duckdb" and row["status"] != "ok":
                     break  # no validated reference exists for the remaining engines
     return 0 if rows and all(row["status"] == "ok" for row in rows) else 1

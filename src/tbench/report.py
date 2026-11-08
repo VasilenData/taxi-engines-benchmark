@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import math
 
 import matplotlib
 
@@ -22,7 +23,11 @@ def load(path: str = "results/results.csv") -> pd.DataFrame:
 
 def totals(df: pd.DataFrame) -> pd.DataFrame:
     """Sum of the four query medians per engine and tier (only where all four succeeded)."""
+    if df.duplicated(['tier', 'engine', 'query']).any():
+        raise ValueError('Duplicate benchmark cases cannot form a four-query total')
     ok = df[df["status"] == "ok"]
+    if any(not math.isfinite(v) or v < 0 for v in ok['median_s']):
+        raise ValueError('Successful benchmark times must be finite and non-negative')
     g = ok.groupby(["tier", "engine"]).agg(total_s=("median_s", "sum"), n=("query", "nunique"), peak_gb=("peak_gb", "max")).reset_index()
     return g[g["n"] == 4]
 
