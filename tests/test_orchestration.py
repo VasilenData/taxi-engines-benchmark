@@ -44,7 +44,7 @@ def test_every_repetition_is_checked_and_mismatch_fails_cli(tmp_path, monkeypatc
         calls[engine] = calls.get(engine, 0) + 1
         value = 2 if engine == "pandas" and calls[engine] == 2 else 1
         frames[out] = pd.DataFrame({"n": [value]})
-        return {"status": "ok", "seconds": 0.01, "peak_gb": 0.01}
+        return {"status": "ok", "seconds": 0.01, "peak_gb": 0.01, "result_rows": 1}
 
     monkeypatch.setattr(orchestrate, "measure", measure)
     monkeypatch.setattr(orchestrate.pd, "read_parquet", lambda path: frames[path])
@@ -154,3 +154,60 @@ def test_duplicate_or_nonfinite_cases_cannot_inflate_report_totals():
     frame.loc[0, 'median_s'] = float('nan')
     with pytest.raises(ValueError, match='finite'):
         totals(frame)
+
+
+@pytest.mark.parametrize("fault", ["missing", "corrupt", "row_count", "missing_count"])
+def test_unwritten_or_invalid_repetition_cannot_reuse_previous_result(tmp_path, monkeypatch, fault):
+    from pathlib import Path
+
+    output = tmp_path / "results.csv"
+    monkeypatch.setattr(sys, "argv", ["bench", "--tiers", "1m", "--engines", "pandas", "--queries", "q1_groupby",
+                                     "--reps", "2", "--out", str(output)])
+    monkeypatch.setattr(orchestrate, "files_for", lambda tier: ["synthetic.parquet"])
+    paths = []
+
+    def worker(engine, tier, query, out, timeout):
+        paths.append(Path(out))
+        result = {"status": "ok", "seconds": 0.1, "peak_gb": 0.1, "result_rows": 1}
+        if len(paths) == 1:
+            pd.DataFrame({"n": [7]}).to_parquet(out)
+        elif fault == "corrupt":
+            Path(out).write_bytes(b"not parquet")
+        elif fault == "row_count":
+            pd.DataFrame({"n": [7, 8]}).to_parquet(out)
+        elif fault == "missing_count":
+            pd.DataFrame({"n": [7]}).to_parquet(out)
+            result.pop("result_rows")
+        return result
+
+    monkeypatch.setattr(orchestrate, "measure", worker)
+    assert orchestrate.main() == 1
+    rows = list(csv.DictReader(output.open(newline="")))
+    assert len(rows) == 1  # No engine is measured against an unvalidated DuckDB reference.
+    assert rows[0]["status"] == "error" and rows[0]["runs"] == "1"
+    assert "invalid result artifact" in rows[0]["detail"]
+    assert paths[0] != paths[1]
+    assert not any(path.exists() for path in paths)  # Temporary outputs are cleaned on failure.
+
+
+def test_valid_workers_use_a_fresh_artifact_for_every_case_and_repetition(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    output = tmp_path / "results.csv"
+    monkeypatch.setattr(sys, "argv", ["bench", "--tiers", "1m", "--engines", "pandas", "--queries", "q1_groupby",
+                                     "--reps", "2", "--out", str(output)])
+    monkeypatch.setattr(orchestrate, "files_for", lambda tier: ["synthetic.parquet"])
+    paths = []
+
+    def worker(engine, tier, query, out, timeout):
+        paths.append(Path(out))
+        assert not Path(out).exists()
+        pd.DataFrame({"n": [7]}).to_parquet(out)
+        return {"status": "ok", "seconds": 0.1, "peak_gb": 0.1, "result_rows": 1}
+
+    monkeypatch.setattr(orchestrate, "measure", worker)
+    assert orchestrate.main() == 0
+    rows = list(csv.DictReader(output.open(newline="")))
+    assert len(rows) == 2 and all(row["runs"] == "2" for row in rows)
+    assert rows[-1]["agrees_with_duckdb"] == "True"
+    assert len(set(paths)) == 4 and not any(path.exists() for path in paths)
