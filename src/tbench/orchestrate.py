@@ -72,6 +72,8 @@ def measure(engine: str, tier: str, query: str, out: str, timeout: int) -> dict:
         if (not isinstance(seconds, (int, float)) or isinstance(seconds, bool)
                 or not math.isfinite(seconds) or seconds < 0):
             raise ValueError('invalid seconds')
+        if type(d.get('result_rows')) is not int or d['result_rows'] < 0:
+            raise ValueError('invalid result row count')
         if (d.get('engine'), d.get('tier'), d.get('query')) != (engine, tier, query):
             raise ValueError('worker identity does not match requested case')
     except (ValueError, TypeError, KeyError, IndexError):
@@ -133,43 +135,49 @@ def main() -> int:
             ap.error(f'--{name} must not contain duplicates')
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     rows = []
-    tmp = tempfile.mkdtemp()
-    for tier in a.tiers:
-        n_files = len(files_for(tier))
-        for q in a.queries:
-            ref_path = f"{tmp}/ref_{tier}_{q}.parquet"
-            for eng in ["duckdb"] + [e for e in a.engines if e != "duckdb"]:
-                if eng not in a.engines and eng != "duckdb":
-                    continue
-                times, peaks, agree, last = [], [], None, None
+    with tempfile.TemporaryDirectory(prefix="taxi-benchmark-") as tmp:
+        for tier in a.tiers:
+            n_files = len(files_for(tier))
+            for q in a.queries:
                 reference = None
-                for r in range(a.reps):
-                    out = ref_path if eng == "duckdb" else f"{tmp}/{eng}_{tier}_{q}.parquet"
-                    m = measure(eng, tier, q, out, a.timeout)
-                    last = m
-                    if m["status"] != "ok":
-                        break
-                    result = pd.read_parquet(out)
-                    if eng == "duckdb" and r == 0:
-                        reference = result
-                    expected = reference if eng == "duckdb" else pd.read_parquet(ref_path)
-                    if not same(result, expected):
-                        agree = False
-                        last = {"status": "mismatch", "detail": f"result mismatch on repetition {r + 1}"}
-                        break
-                    agree = True
-                    times.append(m["seconds"])
-                    peaks.append(m["peak_gb"])
-                row = {"tier": tier, "files": n_files, "query": q, "engine": eng, "status": last["status"],
-                       "median_s": round(statistics.median(times), 2) if times else "",
-                       "min_s": min(times) if times else "", "runs": len(times),
-                       "peak_gb": max(peaks) if peaks else "", "agrees_with_duckdb": "" if eng == "duckdb" else agree,
-                       "detail": last.get("detail", "")}
-                rows.append(row)
-                print(row, flush=True)
-                write_results(a.out, rows)
-                if eng == "duckdb" and row["status"] != "ok":
-                    break  # no validated reference exists for the remaining engines
+                for eng in ["duckdb"] + [e for e in a.engines if e != "duckdb"]:
+                    times, peaks, agree, last = [], [], None, None
+                    for r in range(a.reps):
+                        # Every invocation gets a path that has never existed. A worker
+                        # cannot accidentally reuse a previous repetition's valid file.
+                        out = str(Path(tmp) / f"{eng}_{tier}_{q}_{r}.parquet")
+                        m = measure(eng, tier, q, out, a.timeout)
+                        last = m
+                        if m["status"] != "ok":
+                            break
+                        try:
+                            if type(m.get("result_rows")) is not int or m["result_rows"] < 0:
+                                raise ValueError("worker result_rows must be a non-negative integer")
+                            result = pd.read_parquet(out)
+                            if len(result) != m["result_rows"]:
+                                raise ValueError("artifact row count differs from worker measurement")
+                        except (OSError, ValueError) as exc:
+                            last = {"status": "error", "detail": f"invalid result artifact: {type(exc).__name__}"}
+                            break
+                        if eng == "duckdb" and r == 0:
+                            reference = result
+                        if reference is None or not same(result, reference):
+                            agree = False
+                            last = {"status": "mismatch", "detail": f"result mismatch on repetition {r + 1}"}
+                            break
+                        agree = True
+                        times.append(m["seconds"])
+                        peaks.append(m["peak_gb"])
+                    row = {"tier": tier, "files": n_files, "query": q, "engine": eng, "status": last["status"],
+                           "median_s": round(statistics.median(times), 2) if times else "",
+                           "min_s": min(times) if times else "", "runs": len(times),
+                           "peak_gb": max(peaks) if peaks else "", "agrees_with_duckdb": "" if eng == "duckdb" else agree,
+                           "detail": last.get("detail", "")}
+                    rows.append(row)
+                    print(row, flush=True)
+                    write_results(a.out, rows)
+                    if eng == "duckdb" and row["status"] != "ok":
+                        break  # no validated reference exists for the remaining engines
     return 0 if rows and all(row["status"] == "ok" for row in rows) else 1
 
 
